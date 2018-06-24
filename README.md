@@ -94,9 +94,128 @@ Class c = object_getClass(array3);    //输出__NSArrayM
 从而去隐藏一些私有API的实现细节。关于类族的一些讨论，可以移步我的这一篇博客，有更加详细的讨论。
 [由objectAtIndex引发的数组越界的思考](https://blog.csdn.net/peipeiq/article/details/80707686)。  
 
+### 三、架构思考
+　　关于Masonry的一些方法的组织，这里简要梳理一下。并且贴出一些自己的思考。先看一下总的头文件，这里介绍了各个类的功能。
+```
+#import "MASUtilities.h"            ->masonry的一些公共的工具类
+#import "View+MASAdditions.h"       ->view的类扩展，常用的方法就是定义在这里
+#import "View+MASShorthandAdditions.h".   ->Shorthand view additions without the 'mas_' prefixes,
+#import "ViewController+MASAdditions.h".  
+#import "NSArray+MASAdditions.h"         ->一组views进行约束，没什么特别
+#import "NSArray+MASShorthandAdditions.h"   ->同上
+#import "MASConstraint.h"                ->Constraint的抽象基类。其子类有MASViewConstraint和MASCompositeConstraint
+#import "MASCompositeConstraint.h"       ->包装多个MASViewConstraint实例。（例如size和center）
+#import "MASViewAttribute.h"             ->用来包装一个view的功能类，让一个view和NSLayoutAttribute产生关联
+#import "MASViewConstraint.h"            ->包装一些用于设置NSLayoutConstraint的属性
+#import "MASConstraintMaker.h"           ->顾名思义，用来制造Constraint
+#import "MASLayoutConstraint.h"          ->NSLayoutConstraint的子类，仅仅添加了一个mas_key，作为标志属性
+#import "NSLayoutConstraint+MASDebugAdditions.h"
+```
+入口很简单，通过一个类扩展
+```
+- (NSArray *)mas_makeConstraints:(void(^)(MASConstraintMaker *))block {
+    //将view的translatesAutoresizingMaskIntoConstraint关掉
+    self.translatesAutoresizingMaskIntoConstraints = NO;
+    //初始化一个maker并将view传进去
+    MASConstraintMaker *constraintMaker = [[MASConstraintMaker alloc] initWithView:self];
+    //通过block去设置constraintMaker。一般一条语句对应一个或者两个MASLayoutConstraint。然后保存在一个可变数组@property (nonatomic, strong) NSMutableArray *constraints;
+    block(constraintMaker);
+    //取出constraintMaker中的constraints，遍历后根据constraint生成MASLayoutConstraint并添加至每个视图的约束。
+    return [constraintMaker install];
+}
+```
+关键方法有两个，block(constraintMaker)和constraintMaker install。  
+在block中，我们通常会去设置一些layout的属性，然后保存在一个可变数组中，最终通过install方法去完成约束的添加。  
+####简单总结：  
+这种链式语法可以避免我们写过多的胶水代码，增强了代码的可读性，其实系统的NSLayoutConstraint确实不友好，导致我们一个view的约束会写出这一串代码：
+```
+[superview addConstraints:@[
 
+    //view1 constraints
+    [NSLayoutConstraint constraintWithItem:view1
+                                 attribute:NSLayoutAttributeTop
+                                 relatedBy:NSLayoutRelationEqual
+                                    toItem:superview
+                                 attribute:NSLayoutAttributeTop
+                                multiplier:1.0
+                                  constant:padding.top],
 
+    [NSLayoutConstraint constraintWithItem:view1
+                                 attribute:NSLayoutAttributeLeft
+                                 relatedBy:NSLayoutRelationEqual
+                                    toItem:superview
+                                 attribute:NSLayoutAttributeLeft
+                                multiplier:1.0
+                                  constant:padding.left],
 
+    [NSLayoutConstraint constraintWithItem:view1
+                                 attribute:NSLayoutAttributeBottom
+                                 relatedBy:NSLayoutRelationEqual
+                                    toItem:superview
+                                 attribute:NSLayoutAttributeBottom
+                                multiplier:1.0
+                                  constant:-padding.bottom],
+
+    [NSLayoutConstraint constraintWithItem:view1
+                                 attribute:NSLayoutAttributeRight
+                                 relatedBy:NSLayoutRelationEqual
+                                    toItem:superview
+                                 attribute:NSLayoutAttributeRight
+                                multiplier:1
+                                  constant:-padding.right],
+
+ ]];
+```
+其中确实有太多属性我们要一直重复去写，而且attribute的枚举名词过长，导致写起来也十分冗杂，所以链式语法的简介性也就体现出来。其实在使用系统
+的NSLayoutConstraints还是极容易出现布局错误导致app崩溃。所以masonry也做了很多边界值处理和防止重复layout的机制。  
+其实masonry的源码要封装的系统的方法不多，可以说看了所有代码就发现关键方法也就封装了这里。
+```
+//使用系统NSLayoutConstraint的方法（相当于二次封装）
+    //通过一个for循环，每有一个NSLayoutConstraint就install一次。
+    MASLayoutConstraint *layoutConstraint
+        = [MASLayoutConstraint constraintWithItem:firstLayoutItem
+                                        attribute:firstLayoutAttribute
+                                        relatedBy:self.layoutRelation
+                                           toItem:secondLayoutItem
+                                        attribute:secondLayoutAttribute
+                                       multiplier:self.layoutMultiplier
+                                         constant:self.layoutConstant];
+    
+    //MASLayoutConstraint这个类就是为了新增一个属性mas_key,在debug中可以使用到，对具体工程帮助不大。
+    layoutConstraint.priority = self.layoutPriority;
+    layoutConstraint.mas_key = self.mas_key;
+    
+    if (self.secondViewAttribute.view) {
+        MAS_VIEW *closestCommonSuperview = [self.firstViewAttribute.view mas_closestCommonSuperview:self.secondViewAttribute.view];
+        NSAssert(closestCommonSuperview,
+                 @"couldn't find a common superview for %@ and %@",
+                 self.firstViewAttribute.view, self.secondViewAttribute.view);
+        self.installedView = closestCommonSuperview;
+    } else if (self.firstViewAttribute.isSizeAttribute) {
+        self.installedView = self.firstViewAttribute.view;
+    } else {
+        self.installedView = self.firstViewAttribute.view.superview;
+    }
+
+    MASLayoutConstraint *existingConstraint = nil;
+    if (self.updateExisting) {
+        existingConstraint = [self layoutConstraintSimilarTo:layoutConstraint];
+    }
+    if (existingConstraint) {
+        // just update the constant
+        existingConstraint.constant = layoutConstraint.constant;
+        self.layoutConstraint = existingConstraint;
+    } else {
+        //最终添加约束
+        [self.installedView addConstraint:layoutConstraint];
+        
+        self.layoutConstraint = layoutConstraint;
+        [firstLayoutItem.mas_installedConstraints addObject:self];
+    }
+```
+其他上万行代码都是为了这个方法服务的。这也就看出oc代码的一个灵活性。masonry的源码不难看懂，而且代码量比较少，所以还是比较容易了解它的核心。
+关键还是要想得懂那些block方法的回调。用block作为返回值，其实就是把一个函数作为返回值，这种做法在js中比较常见，而且js中写法也更加简洁易懂。后面有机会
+会写一写这两方面的对比。
 
 
 
